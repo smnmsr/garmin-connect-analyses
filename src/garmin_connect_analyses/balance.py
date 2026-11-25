@@ -8,10 +8,14 @@ DRIFT_BASELINE_S = 1200  # first 20 min: drift baseline, and the shortest ride w
 DRIFT_MIN_POWER_SHARE = 0.5  # trailing 5 min power must reach this share of baseline power
 GRADIENT_MIN_M = 30  # less distance than this in the 15 s window: grade is noise
 MIN_TORQUE_RPM = 30  # below this, crank torque is not computed (freewheeling)
+SD_WINDOW_S = 60  # window of the variability outcome left_sd_60s
+SD_MIN_SAMPLES = 30  # usable samples needed in that window, fewer and the SD is unstable
 FEATURE_COLUMNS = [
-    "activity_id", "year", "indoor", "elapsed_s", "ride_fraction", "left_pct", "left_pct_10s",
+    "activity_id", "year", "indoor", "elapsed_s", "ride_fraction", "left_pct", "left_pct_10s", "left_sd_60s",
     "power", "power_60s", "cadence", "crank_torque", "heart_rate", "heart_rate_30s",
     "cum_work_kJ", "since_break_s", "hr_power_drift", "gradient_15s", "speed",
+    "temperature", "respiration_rate", "left_torque_eff", "right_torque_eff", "left_pedal_smooth", "right_pedal_smooth",
+    "left_pco", "right_pco", "left_phase_deg", "right_phase_deg",
 ]
 
 
@@ -115,6 +119,23 @@ def trailing_mean(times, values, window, min_count=1):
     return means
 
 
+def trailing_sd(times, values, window, min_count):
+    """Population SD of values over the trailing window, with the same rules as trailing_mean."""
+    means = trailing_mean(times, values, window, min_count)
+    squares = trailing_mean(times, [None if v is None else v * v for v in values], window, min_count)
+    return [math.sqrt(max(0.0, sq - m * m)) if m is not None else None for m, sq in zip(means, squares)]
+
+
+def reported(value):
+    """Torque effectiveness and pedal smoothness: 0 is 'no reading' in these FIT fields, so it is missing."""
+    return value or None
+
+
+def phase_span(angles):
+    """Power phase in degrees, from the start angle to the end angle, mod 360. None if not reported."""
+    return (angles[1] - angles[0]) % 360 if angles else None
+
+
 def pause_ends(events, start, min_s=PAUSE_MIN_S):
     """Elapsed seconds at which each pause of at least min_s ended.
 
@@ -152,7 +173,8 @@ def gradient_pct(times, altitude, distance, window=15):
 def hr_power_drift(times, hr, power, total_s):
     """Percent change in heart rate per watt: trailing 5 min against the first 20 min. None for rides under 20 min.
 
-    Empty where trailing 5 min power is below DRIFT_MIN_POWER_SHARE of the baseline power (coasting, stops).
+    Empty before the 20 min baseline has ended, so no later data is used. Also empty where trailing 5 min power
+    is below DRIFT_MIN_POWER_SHARE of the baseline power (coasting, stops).
     """
     if not total_s or total_s < DRIFT_BASELINE_S:
         return [None] * len(times)
@@ -165,8 +187,8 @@ def hr_power_drift(times, hr, power, total_s):
     floor = DRIFT_MIN_POWER_SHARE * base_w_mean
     hr_5, w_5 = trailing_mean(times, hr, 300), trailing_mean(times, power, 300)
     return [
-        (h / p / base - 1) * 100 if h is not None and p is not None and p >= floor else None
-        for h, p in zip(hr_5, w_5)
+        (h / p / base - 1) * 100 if t >= DRIFT_BASELINE_S and h is not None and p is not None and p >= floor else None
+        for t, h, p in zip(times, hr_5, w_5)
     ]
 
 
@@ -188,6 +210,7 @@ def feature_rows(messages, ride):
     left = [left_pct(r.get("left_right_balance")) for r in records]
     usable = [pct if pct is not None and p else None for pct, p in zip(left, power)]  # known side and power > 0
     left_10s = trailing_mean(times, usable, 10, min_count=5)
+    left_sd = trailing_sd(times, usable, SD_WINDOW_S, SD_MIN_SAMPLES)
     power_60s = trailing_mean(times, power, 60)
     hr_30s = trailing_mean(times, hr, 30)
     drift = hr_power_drift(times, hr, power, total_s)
@@ -198,6 +221,7 @@ def feature_rows(messages, ride):
     rows = []
     for i, t in enumerate(times):
         p, c = power[i], cadence[i]
+        r = records[i]
         k = bisect.bisect_right(breaks, t) - 1
         rows.append({
             "activity_id": ride["activityId"],
@@ -207,6 +231,7 @@ def feature_rows(messages, ride):
             "ride_fraction": t / span_s if span_s else None,
             "left_pct": left[i],
             "left_pct_10s": left_10s[i],
+            "left_sd_60s": left_sd[i],
             "power": p,
             "power_60s": power_60s[i],
             "cadence": c,
@@ -218,5 +243,15 @@ def feature_rows(messages, ride):
             "hr_power_drift": drift[i],
             "gradient_15s": grade[i],
             "speed": speed[i] * 3.6 if speed[i] is not None else None,
+            "temperature": r.get("temperature"),
+            "respiration_rate": r.get("enhanced_respiration_rate"),
+            "left_torque_eff": reported(r.get("left_torque_effectiveness")),
+            "right_torque_eff": reported(r.get("right_torque_effectiveness")),
+            "left_pedal_smooth": reported(r.get("left_pedal_smoothness")),
+            "right_pedal_smooth": reported(r.get("right_pedal_smoothness")),
+            "left_pco": r.get("left_pco"),
+            "right_pco": r.get("right_pco"),
+            "left_phase_deg": phase_span(r.get("left_power_phase")),
+            "right_phase_deg": phase_span(r.get("right_power_phase")),
         })
     return rows
