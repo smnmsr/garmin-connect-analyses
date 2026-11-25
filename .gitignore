@@ -27,3 +27,6 @@ wheels/
 
 # Generated output
 output/
+
+# Downloaded Garmin data
+data/
