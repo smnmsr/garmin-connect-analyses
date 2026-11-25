@@ -28,4 +28,5 @@ src/garmin_connect_analyses/   shared code: Garmin API, FIT decoding
 scripts/                       one analysis per file
 output/                        generated files (git-ignored)
 data/                          downloaded Garmin files (git-ignored)
+docs/                          definitions and units of analysis features
 ```
